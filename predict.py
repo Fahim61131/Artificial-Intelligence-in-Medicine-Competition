@@ -1,67 +1,70 @@
-{
- "cells": [
-  {
-   "cell_type": "code",
-   "execution_count": 3,
-   "id": "3faf0ee7-a057-4eba-91b0-cc1592c8790e",
-   "metadata": {},
-   "outputs": [
-    {
-     "ename": "ModuleNotFoundError",
-     "evalue": "No module named 'client'",
-     "output_type": "error",
-     "traceback": [
-      "\u001b[0;31m---------------------------------------------------------------------------\u001b[0m",
-      "\u001b[0;31mModuleNotFoundError\u001b[0m                       Traceback (most recent call last)",
-      "Input \u001b[0;32mIn [3]\u001b[0m, in \u001b[0;36m<cell line: 2>\u001b[0;34m()\u001b[0m\n\u001b[1;32m      1\u001b[0m \u001b[38;5;66;03m# Nichts Ändern!!\u001b[39;00m\n\u001b[0;32m----> 2\u001b[0m \u001b[38;5;28;01mimport\u001b[39;00m \u001b[38;5;21;01mclient\u001b[39;00m\n\u001b[1;32m      3\u001b[0m \u001b[38;5;28;01mimport\u001b[39;00m \u001b[38;5;21;01mtime\u001b[39;00m\n\u001b[1;32m      4\u001b[0m last_server_interaction \u001b[38;5;241m=\u001b[39m \u001b[38;5;241m0\u001b[39m\n",
-      "\u001b[0;31mModuleNotFoundError\u001b[0m: No module named 'client'"
-     ]
-    }
-   ],
-   "source": [
-    "# Nichts Ändern!!\n",
-    "import client\n",
-    "import time\n",
-    "last_server_interaction = 0\n",
-    "cooldown = 10  # seconds"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "4e51e7a9-8d36-46e1-852b-3311fea54adf",
-   "metadata": {},
-   "outputs": [],
-   "source": []
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "id": "cf6c263e-fae6-4efb-b183-96d862edd956",
-   "metadata": {},
-   "outputs": [],
-   "source": []
-  }
- ],
- "metadata": {
-  "kernelspec": {
-   "display_name": "Python [conda env:pytorch]",
-   "language": "python",
-   "name": "conda-env-pytorch-py"
-  },
-  "language_info": {
-   "codemirror_mode": {
-    "name": "ipython",
-    "version": 3
-   },
-   "file_extension": ".py",
-   "mimetype": "text/x-python",
-   "name": "python",
-   "nbconvert_exporter": "python",
-   "pygments_lexer": "ipython3",
-   "version": "3.8.13"
-  }
- },
- "nbformat": 4,
- "nbformat_minor": 5
-}
+import numpy as np
+import joblib
+from typing import List, Dict, Any
+from scipy.signal import butter, filtfilt, iirnotch, welch
+from wettbewerb import get_6montages
+
+# ========== Configuration ==========
+fs = 250
+lowcut, highcut = 0.5, 70.0
+notch_freq, Q = 60.0, 35.0
+bins = [(f, f + 1) for f in range(1, 71)]  # 1Hz bins from 1 to 70
+
+# ========== Load Model ==========
+MODEL_PATH = "best_model.pkl"
+model = joblib.load(MODEL_PATH)
+
+# ========== Filter Setup ==========
+b_bp, a_bp = butter(N=4, Wn=[lowcut, highcut], btype='bandpass', fs=fs)
+b_notch, a_notch = iirnotch(notch_freq, Q, fs)
+
+# ========== Helper Functions ==========
+def apply_filters(signal: np.ndarray) -> np.ndarray:
+    filtered = np.zeros_like(signal)
+    for i in range(signal.shape[1]):
+        x = filtfilt(b_bp, a_bp, signal[:, i])
+        x = filtfilt(b_notch, a_notch, x)
+        filtered[:, i] = x
+    return filtered
+
+def compute_psd_features(signal: np.ndarray, fs: int, bins: List[tuple]) -> np.ndarray:
+    features = []
+    for ch in range(signal.shape[1]):
+        f, Pxx = welch(signal[:, ch], fs=fs, nperseg=512)
+        bin_powers = []
+        for low, high in bins:
+            idx = np.logical_and(f >= low, f < high)
+            power = np.trapz(Pxx[idx], f[idx]) if np.any(idx) else 0.0
+            bin_powers.append(power)
+        bin_powers = np.array(bin_powers)
+        bin_powers /= np.sum(bin_powers) + 1e-9  # normalize
+        features.append(bin_powers)
+    return np.array(features)  # shape: (6, 70)
+
+# ========== Required Submission Function ==========
+def predict_labels(
+    channels: List[str],
+    data: np.ndarray,
+    fs: float,
+    reference_system: str,
+    model_name: str = MODEL_PATH
+) -> Dict[str, Any]:
+    try:
+        _, montage_data, missing = get_6montages(channels, data)
+        if missing:
+            return {"label": 0, "confidence": 0.0}
+
+        montages = montage_data.T  # shape: (samples, 6)
+        filtered = apply_filters(montages)
+        psd = compute_psd_features(filtered, fs, bins)  # shape: (6, 70)
+        feature_vector = psd.flatten().reshape(1, -1)  # shape: (1, 420)
+
+        proba = model.predict_proba(feature_vector)[0]
+        label = int(np.argmax(proba))
+        confidence = float(np.max(proba))
+
+        return {"label": label, "confidence": confidence}
+
+    except Exception as e:
+        print(f"Prediction failed: {e}")
+        return {"label": 0, "confidence": 0.0}
