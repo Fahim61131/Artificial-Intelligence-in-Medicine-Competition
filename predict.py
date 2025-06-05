@@ -52,7 +52,7 @@ def predict_labels(
     try:
         _, montage_data, missing = get_6montages(channels, data)
         if missing:
-            return {"label": 0, "confidence": 0.0}
+            return {"seizure_present": 0, "confidence": 0.0}
 
         montages = montage_data.T  # shape: (samples, 6)
         filtered = apply_filters(montages)
@@ -60,11 +60,11 @@ def predict_labels(
         feature_vector = psd.flatten().reshape(1, -1)  # shape: (1, 420)
 
         proba = model.predict_proba(feature_vector)[0]
-        label = int(np.argmax(proba))
+        label = int(np.argmax(proba))  # 0 or 1
         confidence = float(np.max(proba))
 
-        return {"label": label, "confidence": confidence}
+        return {"seizure_present": label, "confidence": confidence}
 
     except Exception as e:
         print(f"Prediction failed: {e}")
-        return {"label": 0, "confidence": 0.0}
+        return {"seizure_present": 0, "confidence": 0.0}
