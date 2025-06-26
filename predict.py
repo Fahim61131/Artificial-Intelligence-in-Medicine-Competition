@@ -6,6 +6,7 @@ import scipy.io
 from scipy.signal import butter, filtfilt, iirnotch, resample
 from typing import List, Dict, Any
 from wettbewerb import get_3montages
+from typing import List, Dict, Any, Tuple
 
 # ======== DEVICE SETUP ========
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
