@@ -1,8 +1,4 @@
-# -*- coding: utf-8 -*-
-"""
-Final Submission Script for Seizure Detection Task
-Compatible with the challenge evaluation system
-"""
+
 
 import numpy as np
 import torch
