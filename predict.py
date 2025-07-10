@@ -1,195 +1,269 @@
-
-
-import numpy as np
 import torch
 import torch.nn as nn
-from typing import List, Tuple, Dict, Any
-from scipy.signal import butter, filtfilt, iirnotch, resample
+import numpy as np
+from scipy.signal import butter, filtfilt, iirnotch
 from wettbewerb import get_3montages
 
-# Constants
-TARGET_FS = 250.0
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# ======== Model Definition ========
-class ResConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel_size, stride=1, padding=0):
+# ========== Model Definition (should match training) ==========
+class LightConvLSTMTransformer(nn.Module):
+    def __init__(self, in_channels, n_classes=1):
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size, stride, padding),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(),
-            nn.Conv2d(out_ch, out_ch, kernel_size, stride, padding),
-            nn.BatchNorm2d(out_ch)
-        )
-        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+        self.conv = nn.Conv1d(in_channels, 32, kernel_size=3, padding=1)
         self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.3)
+        self.lstm = nn.LSTM(input_size=32, hidden_size=64, batch_first=True, bidirectional=True)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=128, nhead=4, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
+        self.norm = nn.LayerNorm(128)
+        self.fc = nn.Linear(128, n_classes)
 
     def forward(self, x):
-        return self.relu(self.conv(x) + self.skip(x))
-
-class EEGHybridMultitask(nn.Module):
-    def __init__(self, num_channels=3, seq_len=int(TARGET_FS * 2.0)):
-        super().__init__()
-        self.input_norm = nn.LayerNorm([num_channels, seq_len])
-        self.conv_blocks = nn.Sequential(
-            ResConvBlock(1, 16, kernel_size=(3, 5), padding=(1, 2)),
-            ResConvBlock(16, 32, kernel_size=(3, 5), padding=(1, 2)),
-            nn.Dropout(0.1)
-        )
-        self.proj = nn.Conv1d(32 * num_channels, 128, kernel_size=1)
-        self.pos_enc = nn.Parameter(torch.randn(1, seq_len, 128) * 0.1)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=128, nhead=8, dim_feedforward=256,
-            dropout=0.1, batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.classifier = nn.Linear(128, 1)
-        self.regressor = nn.Linear(128, 2)
-
-    def forward(self, x):
-        x = self.input_norm(x)
-        x = x.unsqueeze(1)
-        x = self.conv_blocks(x)
-        B, ch, C, T = x.size()
-        x = x.view(B, ch * C, T)
-        x = self.proj(x)
-        x = x.permute(0, 2, 1) + self.pos_enc
-        x = self.transformer(x)
+        x = self.relu(self.conv(x))
+        x = self.dropout(x)
         x = x.permute(0, 2, 1)
-        x = self.pool(x).squeeze(-1)
-        return self.classifier(x).squeeze(1), self.regressor(x)
+        x, _ = self.lstm(x)
+        x = self.transformer(x)
+        x = x[:, -1, 🙂
+        x = self.norm(x)
+        x = self.fc(x).squeeze(1)
+        return x
 
-# ======== Helpers ========
-def load_model(model_path: str) -> EEGHybridMultitask:
-    model = EEGHybridMultitask().to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model.eval()
-    return model
+# ========== Filter Utilities ==========
 
-def apply_filters(data: np.ndarray, fs: float) -> np.ndarray:
-    b_bp, a_bp = butter(4, [0.5 / (fs / 2), 70.0 / (fs / 2)], btype='band')
-    b_notch, a_notch = iirnotch(50.0 / (fs / 2), Q=35)
-    out = np.zeros_like(data)
-    for ch in range(data.shape[1]):
-        x = filtfilt(b_bp, a_bp, data[:, ch])
-        x = filtfilt(b_notch, a_notch, x)
-        out[:, ch] = x
-    return out
+def create_filters(fs, lowcut=0.5, highcut=70.0, notch_freq=60.0, Q=35.0):
+    b_bp, a_bp = butter(N=4, Wn=[lowcut/(fs/2), highcut/(fs/2)], btype='band')
+    b_notch, a_notch = iirnotch(w0=notch_freq/(fs/2), Q=Q)
+    return b_bp, a_bp, b_notch, a_notch
 
-def extract_windows(data: np.ndarray, fs: float, window_sec: float = 2.0, stride_sec: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
-    W = int(fs * window_sec)
-    S = int(fs * stride_sec)
-    windows, starts = [], []
-    for start in range(0, len(data) - W + 1, S):
-        seg = data[start:start + W].T
-        std = seg.std(axis=1, keepdims=True)
-        std[std < 1e-4] = 1e-4
-        seg = (seg - seg.mean(axis=1, keepdims=True)) / std
-        windows.append(seg)
-        starts.append(start / fs)
-    return np.stack(windows), np.array(starts)
 
-def smooth_predictions(preds: List[int], min_consec: int = 2, max_gap: int = 1) -> List[int]:
-    result = [0] * len(preds)
-    i = 0
-    while i < len(preds):
-        if preds[i] == 1:
-            start = i
-            gap = 0
-            ones = 1
-            i += 1
-            while i < len(preds) and (preds[i] == 1 or gap < max_gap):
-                if preds[i] == 1:
-                    ones += 1
-                    gap = 0
-                else:
-                    gap += 1
-                i += 1
-            end = i
-            if ones >= min_consec:
-                for j in range(start, end):
-                    result[j] = 1
-        else:
-            i += 1
-    return result
+def apply_filters(signal, b_bp, a_bp, b_notch, a_notch):
+    filtered = np.zeros_like(signal)
+    for i in range(signal.shape[1]):
+        x = filtfilt(b_bp, a_bp, signal[:, i])
+        filtered[:, i] = filtfilt(b_notch, a_notch, x)
+    return filtered
 
-# ======== Main Interface ========
-def predict_labels(channels: List[str], data: np.ndarray, fs: float, reference_system: str, model_name: str = "best_multitask_model.pt") -> Dict[str, Any]:
-    try:
-        _, montage_data, _ = get_3montages(channels, data)
-        if montage_data.shape[1] != 3:
-            montage_data = montage_data.T if montage_data.shape[0] == 3 else None
-        if montage_data is None:
-            raise ValueError("Montage extraction failed")
+# ========== Sliding Predict Function ==========
+def predict_sliding(channels, data, fs, reference_system,
+                    model_path='best_light_convlstm_transformer_model.pth',
+                    window_sec=5, stride_sec=2, prob_thresh=0.5):
+    """
+    Slides a window of length window_sec with stride stride_sec over the signal,
+    predicts seizure probability per window, groups consecutive positive windows,
+    and returns the most prominent seizure event.
+    """
+    # Load model
+    checkpoint = torch.load(model_path, map_location='cpu')
+    in_channels = checkpoint.get('input_channels', 3)
+    model = LightConvLSTMTransformer(in_channels).eval()
+    model.load_state_dict(checkpoint['model_state_dict'])
 
-        # Resample if needed
-        if fs != TARGET_FS:
-            num_samples = int(montage_data.shape[0] * TARGET_FS / fs)
-            montage_data = resample(montage_data, num_samples, axis=0)
-            fs = TARGET_FS
+    # Extract 3 bipolar montages
+    _, mont, _ = get_3montages(channels, data)
+    mont = mont.T  # shape (T, C)
 
-        # Filtering
-        filtered = apply_filters(montage_data, fs)
-        windows, starts = extract_windows(filtered, fs)
+    # Filters
+    b_bp, a_bp, b_notch, a_notch = create_filters(fs)
 
-        # Model inference
-        model = load_model(model_name)
-        all_probs, all_onsets, all_offsets = [], [], []
+    # Window params
+    ws = int(window_sec * fs)
+    ss = int(stride_sec * fs)
+    total_samples = mont.shape[0]
+
+    # Slide and predict
+    probs = []
+    positions = []
+    for start in range(0, total_samples - ws + 1, ss):
+        segment = mont[start:start + ws]
+        # filtering
+        seg_f = apply_filters(segment, b_bp, a_bp, b_notch, a_notch)
+        # normalize per-channel
+        seg_norm = (seg_f - seg_f.mean(axis=0)) / (seg_f.std(axis=0) + 1e-6)
+        x = torch.from_numpy(seg_norm.T).unsqueeze(0).float()  # (1, C, ws)
         with torch.no_grad():
-            for i in range(0, len(windows), 64):
-                batch = torch.tensor(windows[i:i + 64], dtype=torch.float32).to(device)
-                logits, regs = model(batch)
-                all_probs.extend(torch.sigmoid(logits).cpu().numpy().tolist())
-                all_onsets.extend(regs[:, 0].cpu().numpy().tolist())
-                all_offsets.extend(regs[:, 1].cpu().numpy().tolist())
+            logit = model(x)
+            prob = torch.sigmoid(logit).item()
+        probs.append(prob)
+        positions.append(start)
 
-        probs = np.array(all_probs)
-        preds = (probs > 0.5).astype(int)
-        smoothed = smooth_predictions(preds)
+    probs = np.array(probs)
+    preds = probs > prob_thresh
 
-        seizure_present = 0
-        seizure_confidence = 0.0
-        onset = None
-        onset_confidence = 0.0
-        offset = None
-        offset_confidence = 0.0
+    # Remove isolated spikes: single-window positives
+    cleaned = preds.copy()
+    for i in range(1, len(preds)-1):
+        if preds[i] and not preds[i-1] and not preds[i+1]:
+            cleaned[i] = False
 
-        if 1 in smoothed:
-            idxs = np.where(smoothed)[0]
-            first, last = idxs[0], idxs[-1]
-            seizure_present = 1
-            seizure_confidence = float(probs[idxs].mean())
-            onset = float(starts[first] + all_onsets[first])
-            offset = float(starts[last] + all_offsets[last])
-            onset_confidence = float(probs[first])
-            offset_confidence = float(probs[last])
+    # Find runs of positive windows
+    events = []  # list of (start_sec, end_sec, mean_prob)
+    in_event = False
+    for idx, flag in enumerate(cleaned):
+        if flag and not in_event:
+            in_event = True
+            ev_start = idx
+        elif not flag and in_event:
+            ev_end = idx - 1
+            in_event = False
+            events.append((ev_start, ev_end))
+    if in_event:
+        events.append((ev_start, len(cleaned)-1))
 
-            if np.isnan(onset) or np.isnan(offset):
-                seizure_present = 0
-                seizure_confidence = 0.0
-                onset = None
-                onset_confidence = 0.0
-                offset = None
-                offset_confidence = 0.0
-
+    if not events:
         return {
-            "seizure_present": seizure_present,
-            "seizure_confidence": seizure_confidence,
-            "onset": onset,
-            "onset_confidence": onset_confidence,
-            "offset": offset,
-            "offset_confidence": offset_confidence
+            'seizure_present': 0,
+            'seizure_confidence': float(probs.max()),
+            'onset': None,
+            'onset_confidence': 0.0,
+            'offset': None,
+            'offset_confidence': 0.0
         }
 
-    except Exception as e:
-        print(f"Error in prediction: {e}")
-        return {
-            "seizure_present": 0,
-            "seizure_confidence": 0.0,
-            "onset": None,
-            "onset_confidence": 0.0,
-            "offset": None,
-            "offset_confidence": 0.0
-        }
+    # Select the longest event
+    lengths = [end-start for start,end in events]
+    best_idx = np.argmax(lengths)
+    start_idx, end_idx = events[best_idx]
+    # convert to seconds
+    onset_sec = positions[start_idx] / fs
+    offset_sec = (positions[end_idx] + ws) / fs
+    conf = float(probs[start_idx:end_idx+1].mean())
+
+    return {
+        'seizure_present': 1,
+        'seizure_confidence': conf,
+        'onset': onset_sec,
+        'onset_confidence': conf,
+        'offset': offset_sec,
+        'offset_confidence': conf
+    }
+Sagor
+import torch
+import torch.nn as nn
+import numpy as np
+from scipy.signal import butter, filtfilt, iirnotch
+from wettbewerb import get_3montages
+
+# ========== Model Definition (should match training) ==========
+class LightConvLSTMTransformer(nn.Module):
+    def __init__(self, in_channels, n_classes=1):
+        super().__init__()
+        self.conv = nn.Conv1d(in_channels, 32, kernel_size=3, padding=1)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.3)
+        self.lstm = nn.LSTM(input_size=32, hidden_size=64, batch_first=True, bidirectional=True)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=128, nhead=4, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
+        self.norm = nn.LayerNorm(128)
+        self.fc = nn.Linear(128, n_classes)
+
+    def forward(self, x):
+        x = self.relu(self.conv(x))
+        x = self.dropout(x)
+        x = x.permute(0, 2, 1)
+        x, _ = self.lstm(x)
+        x = self.transformer(x)
+        x = x[:, -1, 🙂
+        x = self.norm(x)
+        x = self.fc(x).squeeze(1)
+        return x
+
+# ========== Filter Utilities ==========
+def create_filters(fs, lowcut=0.5, highcut=70.0, notch_freq=60.0, Q=35.0):
+    b_bp, a_bp = butter(N=4, Wn=[lowcut/(fs/2), highcut/(fs/2)], btype='band')
+    b_notch, a_notch = iirnotch(w0=notch_freq/(fs/2), Q=Q)
+    return b_bp, a_bp, b_notch, a_notch
+
+def apply_filters(signal, b_bp, a_bp, b_notch, a_notch):
+    filtered = np.zeros_like(signal)
+    for i in range(signal.shape[1]):
+        x = filtfilt(b_bp, a_bp, signal[:, i])
+        filtered[:, i] = filtfilt(b_notch, a_notch, x)
+    return filtered
+
+# ========== Sliding Predict Function ==========
+# Note: This function assumes a sampling rate fs (e.g., 250 Hz).
+def predict_sliding(channels, data, fs=250, reference_system=None,
+                    model_path='best_light_convlstm_transformer_model.pth',
+                    window_sec=5, stride_sec=2, prob_thresh=0.5):
+    """
+    Slides a window of length window_sec with stride stride_sec over the signal sampled at fs Hz,
+    predicts seizure probability per window, groups consecutive positive windows,
+    and returns the most prominent seizure event.
+
+    Args:
+        channels: list of channel names
+        data: raw EEG data array (channels × time)
+        fs: sampling frequency (Hz), default = 250
+        reference_system: unused placeholder for API compatibility
+        model_path: path to the trained model checkpoint
+        window_sec: window length in seconds (default 5)
+        stride_sec: stride length in seconds (default 2)
+        prob_thresh: probability threshold for binary detection (default 0.5)
+    """
+    # Load model
+    checkpoint = torch.load(model_path, map_location='cpu')
+    in_channels = checkpoint.get('input_channels', 3)
+    model = LightConvLSTMTransformer(in_channels).eval()
+    model.load_state_dict(checkpoint['model_state_dict'])
+
+    # Extract 3 bipolar montages
+    _, mont, _ = get_3montages(channels, data)
+    mont = mont.T  # shape (T, C)
+
+    # Filters
+    b_bp, a_bp, b_notch, a_notch = create_filters(fs)
+
+    # Window params (in samples)
+    ws = int(window_sec * fs)    # e.g., 5 sec × 250 Hz = 1250 samples
+    ss = int(stride_sec * fs)    # e.g., 2 sec × 250 Hz = 500 samples
+    total_samples = mont.shape[0]
+
+    # Slide, filter, normalize, and predict
+    probs, positions = [], []
+    for start in range(0, total_samples - ws + 1, ss):
+        segment = mont[start:start + ws]
+        seg_f = apply_filters(segment, b_bp, a_bp, b_notch, a_notch)
+        seg_norm = (seg_f - seg_f.mean(axis=0)) / (seg_f.std(axis=0) + 1e-6)
+        x = torch.from_numpy(seg_norm.T).unsqueeze(0).float()
+        with torch.no_grad():
+            prob = torch.sigmoid(model(x)).item()
+        probs.append(prob)
+        positions.append(start)
+
+    probs = np.array(probs)
+    preds = probs > prob_thresh
+
+    # Remove isolated spikes
+    cleaned = preds.copy()
+    for i in range(1, len(preds)-1):
+        if preds[i] and not preds[i-1] and not preds[i+1]:
+            cleaned[i] = False
+
+    # Find contiguous positive runs
+    events, in_event = [], False
+    for idx, flag in enumerate(cleaned):
+        if flag and not in_event:
+            in_event, ev_start = True, idx
+        elif not flag and in_event:
+            events.append((ev_start, idx-1)); in_event = False
+    if in_event:
+        events.append((ev_start, len(cleaned)-1))
+
+    # If no seizure detected
+    if not events:
+        return {'seizure_present': 0,
+                'seizure_confidence': float(probs.max()),
+                'onset': None, 'onset_confidence': 0.0,
+                'offset': None, 'offset_confidence': 0.0}
+
+    # Select the longest event
+    lengths = [end-start for start,end in events]
+    s_idx, e_idx = events[int(np.argmax(lengths))]
+    onset_sec  = positions[s_idx] / fs
+    offset_sec = (positions[e_idx] + ws) / fs
+    conf       = float(probs[s_idx:e_idx+1].mean())
+
+    return {'seizure_present': 1,
+            'seizure_confidence': conf,
+            'onset': onset_sec, 'onset_confidence': conf,
+            'offset': offset_sec, 'offset_confidence': conf}
