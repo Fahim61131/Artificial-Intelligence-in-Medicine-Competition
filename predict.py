@@ -39,7 +39,7 @@ def apply_filters_full(mont, b_bp, a_bp, b_notch, a_notch):
         out[:, ch] = filtfilt(b_notch, a_notch, x)
     return out
 
-# ========== Prediction Wrapper ==========
+# ========== Top-Level Prediction Function for Evaluation ==========
 def predict_labels(channels, data, fs):
     return predict_sliding(
         channels=channels,
