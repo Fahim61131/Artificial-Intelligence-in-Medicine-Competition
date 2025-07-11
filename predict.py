@@ -4,7 +4,7 @@ import numpy as np
 from scipy.signal import butter, filtfilt, iirnotch
 from wettbewerb import get_3montages
 
-# ========== Model (same as training) ==========
+# ========== Model ==========
 class LightConvLSTMTransformer(nn.Module):
     def __init__(self, in_channels, n_classes=1):
         super().__init__()
@@ -26,7 +26,7 @@ class LightConvLSTMTransformer(nn.Module):
         x = x[:, -1, :]                 # (B, 128)
         return self.fc(self.norm(x)).squeeze(1)
 
-# ========== Filtering ==========
+# ========== Filters ==========
 def create_filters(fs):
     b_bp, a_bp = butter(4, [0.5/(fs/2), 70.0/(fs/2)], btype='band')
     b_notch, a_notch = iirnotch(60.0/(fs/2), Q=35.0)
@@ -39,19 +39,32 @@ def apply_filters_full(mont, b_bp, a_bp, b_notch, a_notch):
         out[:, ch] = filtfilt(b_notch, a_notch, x)
     return out
 
-# ========== Batched Sliding Prediction ==========
+# ========== Prediction Wrapper ==========
+def predict_labels(channels, data, fs):
+    return predict_sliding(
+        channels=channels,
+        data=data,
+        fs=fs,
+        model_path='best_light_convlstm_transformer_model.pth',
+        window_sec=5,
+        stride_sec=2,
+        prob_thresh=0.5,
+        batch_size=64,
+        device='cpu'
+    )
+
+# ========== Sliding Prediction ==========
 def predict_sliding(channels, data, fs=250,
                     model_path='best_light_convlstm_transformer_model.pth',
                     window_sec=5, stride_sec=2, prob_thresh=0.5,
                     batch_size=64, device='cpu'):
-    # load model
+    
     cp = torch.load(model_path, map_location='cpu')
     model = LightConvLSTMTransformer(cp['input_channels']).to(device).eval()
     model.load_state_dict(cp['model_state_dict'])
 
-    # montage + filter once
     _, mont, _ = get_3montages(channels, data)
-    mont = mont.T                            # (T, C)
+    mont = mont.T
     b_bp, a_bp, b_notch, a_notch = create_filters(fs)
     mont = apply_filters_full(mont, b_bp, a_bp, b_notch, a_notch)
 
@@ -60,14 +73,11 @@ def predict_sliding(channels, data, fs=250,
     total = mont.shape[0]
     starts = np.arange(0, total - ws + 1, ss)
 
-    # build all windows
-    windows = np.stack([mont[s:s+ws] for s in starts], axis=0)   # (Nw, ws, C)
-    # normalize per-window & transpose to (Nw, C, ws)
+    windows = np.stack([mont[s:s+ws] for s in starts], axis=0)
     mean = windows.mean(axis=1, keepdims=True)
-    std  = windows.std(axis=1, keepdims=True) + 1e-6
-    windows = ((windows - mean) / std).transpose(0,2,1)
+    std = windows.std(axis=1, keepdims=True) + 1e-6
+    windows = ((windows - mean) / std).transpose(0, 2, 1)
 
-    # batch inference
     probs = []
     with torch.no_grad():
         for i in range(0, len(windows), batch_size):
@@ -76,7 +86,6 @@ def predict_sliding(channels, data, fs=250,
             probs.append(torch.sigmoid(logits).cpu().numpy())
     probs = np.concatenate(probs, axis=0)
 
-    # threshold, clean spikes, group runs (same as before)
     preds = probs > prob_thresh
     for i in range(1, len(preds)-1):
         if preds[i] and not preds[i-1] and not preds[i+1]:
@@ -100,12 +109,11 @@ def predict_sliding(channels, data, fs=250,
             "offset_confidence": 0.0
         }
 
-    # pick longest
     lengths = [j-i for i,j in events]
     si, ei = events[int(np.argmax(lengths))]
-    onset  = starts[si]/fs
-    offset = (starts[ei]+ws)/fs
-    conf   = float(probs[si:ei+1].mean())
+    onset = starts[si] / fs
+    offset = (starts[ei] + ws) / fs
+    conf = float(probs[si:ei+1].mean())
 
     return {
         "seizure_present": 1,
