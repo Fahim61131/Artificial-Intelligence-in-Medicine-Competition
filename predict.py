@@ -21,9 +21,9 @@ class LightConvLSTMTransformer(nn.Module):
         x = self.relu(self.conv(x))
         x = self.dropout(x)
         x = x.permute(0, 2, 1)          # (B, T, C)
-        x, _ = self.lstm(x)            # (B, T, 128)
-        x = self.transformer(x)        # (B, T, 128)
-        x = x[:, -1, 🙂                # (B, 128)
+        x, _ = self.lstm(x)             # (B, T, 128)
+        x = self.transformer(x)         # (B, T, 128)
+        x = x[:, -1, :]                 # (B, 128)
         return self.fc(self.norm(x)).squeeze(1)
 
 # ========== Filtering ==========
@@ -33,7 +33,6 @@ def create_filters(fs):
     return b_bp, a_bp, b_notch, a_notch
 
 def apply_filters_full(mont, b_bp, a_bp, b_notch, a_notch):
-    # apply filtfilt once per channel
     out = np.zeros_like(mont)
     for ch in range(mont.shape[1]):
         x = filtfilt(b_bp, a_bp, mont[:, ch])
@@ -92,8 +91,14 @@ def predict_sliding(channels, data, fs=250,
     if in_ev: events.append((ev0, len(preds)-1))
 
     if not events:
-        return {"seizure_present":0, "seizure_confidence":float(probs.max()),
-                "onset":None,"onset_confidence":0.0,"offset":None,"offset_confidence":0.0}
+        return {
+            "seizure_present": 0,
+            "seizure_confidence": float(probs.max()),
+            "onset": None,
+            "onset_confidence": 0.0,
+            "offset": None,
+            "offset_confidence": 0.0
+        }
 
     # pick longest
     lengths = [j-i for i,j in events]
@@ -102,6 +107,11 @@ def predict_sliding(channels, data, fs=250,
     offset = (starts[ei]+ws)/fs
     conf   = float(probs[si:ei+1].mean())
 
-    return {"seizure_present":1, "seizure_confidence":conf,
-            "onset":onset,"onset_confidence":conf,
-            "offset":offset,"offset_confidence":conf}
+    return {
+        "seizure_present": 1,
+        "seizure_confidence": conf,
+        "onset": onset,
+        "onset_confidence": conf,
+        "offset": offset,
+        "offset_confidence": conf
+    }
