@@ -4,122 +4,104 @@ import numpy as np
 from scipy.signal import butter, filtfilt, iirnotch
 from wettbewerb import get_3montages
 
-# ========== Model Definition (should match training) ==========
+# ========== Model (same as training) ==========
 class LightConvLSTMTransformer(nn.Module):
     def __init__(self, in_channels, n_classes=1):
         super().__init__()
         self.conv = nn.Conv1d(in_channels, 32, kernel_size=3, padding=1)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(0.3)
-        self.lstm = nn.LSTM(input_size=32, hidden_size=64, batch_first=True, bidirectional=True)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=128, nhead=4, batch_first=True)
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
+        self.lstm = nn.LSTM(32, 64, batch_first=True, bidirectional=True)
+        enc_layer = nn.TransformerEncoderLayer(d_model=128, nhead=4, batch_first=True)
+        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=1)
         self.norm = nn.LayerNorm(128)
         self.fc = nn.Linear(128, n_classes)
 
     def forward(self, x):
         x = self.relu(self.conv(x))
         x = self.dropout(x)
-        x = x.permute(0, 2, 1)
-        x, _ = self.lstm(x)
-        x = self.transformer(x)
-        x = x[:, -1, 🙂
-        x = self.norm(x)
-        return self.fc(x).squeeze(1)
+        x = x.permute(0, 2, 1)          # (B, T, C)
+        x, _ = self.lstm(x)            # (B, T, 128)
+        x = self.transformer(x)        # (B, T, 128)
+        x = x[:, -1, 🙂                # (B, 128)
+        return self.fc(self.norm(x)).squeeze(1)
 
-# ========== Filter Utilities ==========
-def create_filters(fs, lowcut=0.5, highcut=70.0, notch_freq=60.0, Q=35.0):
-    b_bp, a_bp = butter(N=4, Wn=[lowcut/(fs/2), highcut/(fs/2)], btype='band')
-    b_notch, a_notch = iirnotch(w0=notch_freq/(fs/2), Q=Q)
+# ========== Filtering ==========
+def create_filters(fs):
+    b_bp, a_bp = butter(4, [0.5/(fs/2), 70.0/(fs/2)], btype='band')
+    b_notch, a_notch = iirnotch(60.0/(fs/2), Q=35.0)
     return b_bp, a_bp, b_notch, a_notch
 
-def apply_filters(signal, b_bp, a_bp, b_notch, a_notch):
-    filtered = np.zeros_like(signal)
-    for i in range(signal.shape[1]):
-        x = filtfilt(b_bp, a_bp, signal[:, i])
-        filtered[:, i] = filtfilt(b_notch, a_notch, x)
-    return filtered
+def apply_filters_full(mont, b_bp, a_bp, b_notch, a_notch):
+    # apply filtfilt once per channel
+    out = np.zeros_like(mont)
+    for ch in range(mont.shape[1]):
+        x = filtfilt(b_bp, a_bp, mont[:, ch])
+        out[:, ch] = filtfilt(b_notch, a_notch, x)
+    return out
 
-# ========== Sliding Predict Function ==========
-def predict_sliding(channels, data, fs=250, reference_system=None,
+# ========== Batched Sliding Prediction ==========
+def predict_sliding(channels, data, fs=250,
                     model_path='best_light_convlstm_transformer_model.pth',
-                    window_sec=5, stride_sec=2, prob_thresh=0.5):
-    """
-    Slides a window of length window_sec with stride stride_sec over the signal sampled at fs Hz,
-    predicts seizure probability per window, groups consecutive positive windows,
-    and returns the most prominent seizure event.
-    """
-    # Load model
-    checkpoint = torch.load(model_path, map_location='cpu')
-    in_channels = checkpoint.get('input_channels', 3)
-    model = LightConvLSTMTransformer(in_channels).eval()
-    model.load_state_dict(checkpoint['model_state_dict'])
+                    window_sec=5, stride_sec=2, prob_thresh=0.5,
+                    batch_size=64, device='cpu'):
+    # load model
+    cp = torch.load(model_path, map_location='cpu')
+    model = LightConvLSTMTransformer(cp['input_channels']).to(device).eval()
+    model.load_state_dict(cp['model_state_dict'])
 
-    # Extract 3 bipolar montages
+    # montage + filter once
     _, mont, _ = get_3montages(channels, data)
-    mont = mont.T  # shape (T, C)
-
-    # Prepare filters
+    mont = mont.T                            # (T, C)
     b_bp, a_bp, b_notch, a_notch = create_filters(fs)
+    mont = apply_filters_full(mont, b_bp, a_bp, b_notch, a_notch)
 
-    # Window parameters
-    ws = int(window_sec * fs)    # window size in samples
-    ss = int(stride_sec * fs)    # stride in samples
+    ws = int(window_sec * fs)
+    ss = int(stride_sec * fs)
     total = mont.shape[0]
+    starts = np.arange(0, total - ws + 1, ss)
 
-    # Slide, filter, normalize, predict
-    probs, positions = [], []
-    for start in range(0, total - ws + 1, ss):
-        seg = mont[start:start + ws]
-        seg_f = apply_filters(seg, b_bp, a_bp, b_notch, a_notch)
-        seg_n = (seg_f - seg_f.mean(axis=0)) / (seg_f.std(axis=0) + 1e-6)
-        x = torch.from_numpy(seg_n.T).unsqueeze(0).float()
-        with torch.no_grad():
-            p = torch.sigmoid(model(x)).item()
-        probs.append(p)
-        positions.append(start)
+    # build all windows
+    windows = np.stack([mont[s:s+ws] for s in starts], axis=0)   # (Nw, ws, C)
+    # normalize per-window & transpose to (Nw, C, ws)
+    mean = windows.mean(axis=1, keepdims=True)
+    std  = windows.std(axis=1, keepdims=True) + 1e-6
+    windows = ((windows - mean) / std).transpose(0,2,1)
 
-    probs = np.array(probs)
+    # batch inference
+    probs = []
+    with torch.no_grad():
+        for i in range(0, len(windows), batch_size):
+            batch = torch.from_numpy(windows[i:i+batch_size]).float().to(device)
+            logits = model(batch)
+            probs.append(torch.sigmoid(logits).cpu().numpy())
+    probs = np.concatenate(probs, axis=0)
+
+    # threshold, clean spikes, group runs (same as before)
     preds = probs > prob_thresh
+    for i in range(1, len(preds)-1):
+        if preds[i] and not preds[i-1] and not preds[i+1]:
+            preds[i] = False
 
-    # Remove isolated spikes
-    cleaned = preds.copy()
-    for i in range(1, len(preds) - 1):
-        if preds[i] and not preds[i - 1] and not preds[i + 1]:
-            cleaned[i] = False
-
-    # Group into events
-    events = []
-    in_ev = False
-    for idx, flag in enumerate(cleaned):
+    events, in_ev = [], False
+    for idx, flag in enumerate(preds):
         if flag and not in_ev:
-            in_ev = True
-            ev_start = idx
+            in_ev, ev0 = True, idx
         elif not flag and in_ev:
-            events.append((ev_start, idx - 1))
-            in_ev = False
-    if in_ev:
-        events.append((ev_start, len(cleaned) - 1))
+            events.append((ev0, idx-1)); in_ev = False
+    if in_ev: events.append((ev0, len(preds)-1))
 
-    # No seizure
     if not events:
-        return {
-            "seizure_present": 0,
-            "seizure_confidence": float(probs.max()),
-            "onset": None, "onset_confidence": 0.0,
-            "offset": None, "offset_confidence": 0.0
-        }
+        return {"seizure_present":0, "seizure_confidence":float(probs.max()),
+                "onset":None,"onset_confidence":0.0,"offset":None,"offset_confidence":0.0}
 
-    # Choose longest event
-    lengths = [e[1] - e[0] for e in events]
+    # pick longest
+    lengths = [j-i for i,j in events]
     si, ei = events[int(np.argmax(lengths))]
-    onset = positions[si] / fs
-    offset = (positions[ei] + ws) / fs
-    conf = float(probs[si:ei + 1].mean())
+    onset  = starts[si]/fs
+    offset = (starts[ei]+ws)/fs
+    conf   = float(probs[si:ei+1].mean())
 
-    return {
-        "seizure_present": 1,
-        "seizure_confidence": conf,
-        "onset": onset, "onset_confidence": conf,
-        "offset": offset, "offset_confidence": conf
-    }
+    return {"seizure_present":1, "seizure_confidence":conf,
+            "onset":onset,"onset_confidence":conf,
+            "offset":offset,"offset_confidence":conf}
