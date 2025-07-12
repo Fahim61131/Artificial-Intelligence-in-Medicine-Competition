@@ -1,142 +1,238 @@
 # -*- coding: utf-8 -*-
 """
-Seizure Detection Script (LightConvLSTMTransformer version)
-Naming and structure adapted for challenge submission
+Enhanced Seizure Detection with Dual-Task Model
+Combines classification and regression for precise seizure localization
 """
 
 import numpy as np
 import torch
 import torch.nn as nn
-from scipy.signal import butter, filtfilt, iirnotch
+from scipy.signal import butter, filtfilt, iirnotch, resample_poly
 from wettbewerb import get_3montages
+from typing import List, Dict, Any
 
-TARGET_FS = 250.0  # Not used here, but kept for convention
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Constants
+TARGET_FS = 250.0
+WINDOW_SIZE = 5.0  # seconds
+STRIDE = 2.0        # seconds
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ======== Model Definition ========
-class LightConvLSTMTransformer(nn.Module):
-    def __init__(self, in_channels, n_classes=1):
+class DualTaskEEGModel(nn.Module):
+    def __init__(self, in_channels):
         super().__init__()
+        # Shared feature extractor
         self.conv = nn.Conv1d(in_channels, 32, kernel_size=3, padding=1)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(0.3)
-        self.lstm = nn.LSTM(32, 64, batch_first=True, bidirectional=True)
-        enc_layer = nn.TransformerEncoderLayer(d_model=128, nhead=4, batch_first=True)
-        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=1)
+
+        self.lstm = nn.LSTM(input_size=32, hidden_size=64,
+                           batch_first=True, bidirectional=True)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=128, nhead=4, batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
         self.norm = nn.LayerNorm(128)
-        self.fc = nn.Linear(128, n_classes)
+
+        # Task-specific heads
+        self.class_head = nn.Linear(128, 1)
+        self.reg_head = nn.Linear(128, 2)
 
     def forward(self, x):
+        # Shared feature extraction
         x = self.relu(self.conv(x))
         x = self.dropout(x)
-        x = x.permute(0, 2, 1)          # (B, T, C)
-        x, _ = self.lstm(x)             # (B, T, 128)
-        x = self.transformer(x)         # (B, T, 128)
-        x = x[:, -1, :]                 # (B, 128)
-        return self.fc(self.norm(x)).squeeze(1)
+        x = x.permute(0, 2, 1)
+        x, _ = self.lstm(x)
+        x = self.transformer(x)
+        x = x[:, -1, :]
+        features = self.norm(x)
 
-# ======== Helpers ========
-def create_filters(fs):
-    b_bp, a_bp = butter(4, [0.5/(fs/2), 70.0/(fs/2)], btype='band')
-    b_notch, a_notch = iirnotch(60.0/(fs/2), Q=35.0)
-    return b_bp, a_bp, b_notch, a_notch
+        # Task-specific outputs
+        class_logits = self.class_head(features).squeeze(1)
+        reg_output = self.reg_head(features)
+        
+        return class_logits, reg_output
 
-def apply_filters(data, b_bp, a_bp, b_notch, a_notch):
-    out = np.zeros_like(data)
+# ======== Helper Functions ========
+def load_model(model_path: str, in_channels: int = 3) -> DualTaskEEGModel:
+    """Load trained model with architecture matching training script"""
+    model = DualTaskEEGModel(in_channels=in_channels).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+    return model
+
+def resample_to_250hz(data: np.ndarray, original_fs: float) -> np.ndarray:
+    """Resample data to 250 Hz using polyphase resampling"""
+    if original_fs == TARGET_FS:
+        return data
+    
+    ratio = TARGET_FS / original_fs
+    n_samples = int(len(data) * ratio)
+    return resample_poly(data, n_samples, len(data), axis=0)
+
+def apply_filters(data: np.ndarray) -> np.ndarray:
+    """Apply bandpass and notch filtering to EEG data"""
+    # Bandpass filter (0.5-70 Hz)
+    b_bp, a_bp = butter(4, [0.5/(TARGET_FS/2), 70.0/(TARGET_FS/2)], btype='band')
+    # Notch filter (50 Hz)
+    b_notch, a_notch = iirnotch(50.0/(TARGET_FS/2), Q=35)
+    
+    filtered = np.zeros_like(data)
     for ch in range(data.shape[1]):
-        x = filtfilt(b_bp, a_bp, data[:, ch])
-        out[:, ch] = filtfilt(b_notch, a_notch, x)
-    return out
+        ch_data = data[:, ch]
+        x = filtfilt(b_bp, a_bp, ch_data)
+        x = filtfilt(b_notch, a_notch, x)
+        filtered[:, ch] = x
+    return filtered
 
-def extract_windows(data, fs, window_sec=5, stride_sec=2):
-    ws = int(window_sec * fs)
-    ss = int(stride_sec * fs)
-    starts = np.arange(0, data.shape[0] - ws + 1, ss)
-    windows = np.stack([data[s:s+ws] for s in starts], axis=0)  # (num_windows, ws, channels)
-    # Normalize each window
-    mean = windows.mean(axis=1, keepdims=True)
-    std = windows.std(axis=1, keepdims=True) + 1e-6
-    windows = ((windows - mean) / std).transpose(0, 2, 1)  # (num_windows, channels, ws)
-    return windows, starts
+def extract_windows(data: np.ndarray, window_samples: int, stride_samples: int):
+    """Extract overlapping windows from EEG data"""
+    n_windows = (data.shape[0] - window_samples) // stride_samples + 1
+    windows = []
+    starts = []
+    
+    for i in range(n_windows):
+        start = i * stride_samples
+        end = start + window_samples
+        window = data[start:end]
+        
+        # Standardize per channel
+        window = (window - window.mean(axis=0)) / (window.std(axis=0) + 1e-6)
+        windows.append(window.T)  # Transpose to (channels, time)
+        starts.append(start / TARGET_FS)  # Start time in seconds
+    
+    return np.stack(windows), np.array(starts)
 
-def smooth_predictions(preds):
-    # Remove single outlier predictions (01*0 to 0)
-    preds = preds.astype(bool)
-    for i in range(1, len(preds) - 1):
-        if preds[i] and not preds[i - 1] and not preds[i + 1]:
-            preds[i] = False
-    return preds.astype(int)
+def merge_seizure_windows(window_preds, window_probs, window_starts, reg_outputs, 
+                         min_seizure_duration=4.0, max_gap=2.0):
+    """
+    Merge adjacent seizure windows into continuous events using:
+    - Classification confidence for detection
+    - Regression outputs for precise timing
+    """
+    # Step 1: Find seizure clusters
+    in_seizure = False
+    current_start = 0.0
+    current_end = 0.0
+    current_max_prob = 0.0
+    clusters = []
+    
+    for i, (pred, prob, start) in enumerate(zip(window_preds, window_probs, window_starts)):
+        if pred == 1:
+            if not in_seizure:
+                # Seizure starts
+                in_seizure = True
+                current_start = start + reg_outputs[i, 0]  # Use regression onset
+                current_end = start + reg_outputs[i, 1]    # Use regression offset
+                current_max_prob = prob
+            else:
+                # Extend current seizure
+                current_end = start + reg_outputs[i, 1]  # Update offset with current window
+                current_max_prob = max(current_max_prob, prob)
+        elif in_seizure:
+            # Check if gap is small enough to continue
+            next_start = window_starts[i+1] if i+1 < len(window_starts) else start + STRIDE
+            gap = next_start - current_end
+            
+            if gap > max_gap:
+                # Seizure ends
+                in_seizure = False
+                # Ensure valid duration
+                duration = current_end - current_start
+                if duration >= min_seizure_duration:
+                    clusters.append((current_start, current_end, current_max_prob))
+    
+    # Handle seizure continuing to end
+    if in_seizure:
+        duration = current_end - current_start
+        if duration >= min_seizure_duration:
+            clusters.append((current_start, current_end, current_max_prob))
+    
+    return clusters
 
-# ======== Main Interface ========
-def predict_labels(channels, data, fs, model_name='best_light_convlstm_transformer_model.pth'):
+# ======== Main Prediction Function ========
+def predict_labels(
+    channels: List[str], 
+    data: np.ndarray, 
+    fs: float, 
+    reference_system: str, 
+    model_name: str = "best_dual_task_model.pth"
+) -> Dict[str, Any]:
+    """
+    Main prediction function required by the competition
+    Returns dictionary with seizure presence and timing information
+    """
     try:
-        # Extract montage
+        # ===== 1. Preprocessing =====
+        # Convert to 3-montage format
         _, montage_data, _ = get_3montages(channels, data)
-        montage_data = montage_data.T  # shape: (samples, channels)
-
-        # Filtering
-        b_bp, a_bp, b_notch, a_notch = create_filters(fs)
-        filtered = apply_filters(montage_data, b_bp, a_bp, b_notch, a_notch)
-
-        # Windowing
-        windows, starts = extract_windows(filtered, fs, window_sec=5, stride_sec=2)
-
-        # Model
-        checkpoint = torch.load(model_name, map_location='cpu')
-        model = LightConvLSTMTransformer(checkpoint['input_channels']).to(DEVICE).eval()
-        model.load_state_dict(checkpoint['model_state_dict'])
-
-        # Prediction
-        probs = []
-        batch_size = 64
+        if montage_data is None:
+            raise ValueError("Montage conversion failed")
+        
+        # Resample to 250Hz if needed
+        if fs != TARGET_FS:
+            montage_data = resample_to_250hz(montage_data, fs)
+        
+        # Apply filters
+        filtered = apply_filters(montage_data)
+        
+        # ===== 2. Windowing =====
+        window_samples = int(WINDOW_SIZE * TARGET_FS)
+        stride_samples = int(STRIDE * TARGET_FS)
+        windows, starts = extract_windows(filtered, window_samples, stride_samples)
+        
+        # ===== 3. Model Inference =====
+        model = load_model(model_name, in_channels=windows.shape[1])
+        batch_size = 128
+        all_probs = []
+        all_regs = []
+        
         with torch.no_grad():
             for i in range(0, len(windows), batch_size):
-                batch = torch.from_numpy(windows[i:i + batch_size]).float().to(DEVICE)
-                logits = model(batch)
-                probs.append(torch.sigmoid(logits).cpu().numpy())
-        probs = np.concatenate(probs, axis=0)
+                batch = windows[i:i+batch_size]
+                batch_tensor = torch.tensor(batch, dtype=torch.float32).to(device)
+                logits, regs = model(batch_tensor)
+                probs = torch.sigmoid(logits).cpu().numpy()
+                all_probs.extend(probs)
+                all_regs.extend(regs.cpu().numpy())
+        
+        probs = np.array(all_probs)
+        regs = np.array(all_regs)
         preds = (probs > 0.5).astype(int)
-        smoothed = smooth_predictions(preds)
-
-        # Event detection
-        events, in_ev = [], False
-        for idx, flag in enumerate(smoothed):
-            if flag and not in_ev:
-                in_ev, ev0 = True, idx
-            elif not flag and in_ev:
-                events.append((ev0, idx - 1))
-                in_ev = False
-        if in_ev:
-            events.append((ev0, len(smoothed) - 1))
-
-        if not events:
+        
+        # ===== 4. Post-processing =====
+        # Merge adjacent windows into seizure events using regression for timing
+        seizures = merge_seizure_windows(preds, probs, starts, regs)
+        
+        # ===== 5. Prepare Output =====
+        if seizures:
+            # For competition, we assume single seizure per recording
+            # Select seizure with highest confidence
+            best_seizure = max(seizures, key=lambda x: x[2])
+            onset, offset, confidence = best_seizure
+            
+            return {
+                "seizure_present": 1,
+                "seizure_confidence": float(confidence),
+                "onset": float(onset),
+                "onset_confidence": float(confidence),
+                "offset": float(offset),
+                "offset_confidence": float(confidence)
+            }
+        else:
             return {
                 "seizure_present": 0,
-                "seizure_confidence": float(probs.max()),
+                "seizure_confidence": 0.0,
                 "onset": None,
                 "onset_confidence": 0.0,
                 "offset": None,
                 "offset_confidence": 0.0
             }
-
-        # Pick longest event
-        lengths = [j - i for i, j in events]
-        si, ei = events[int(np.argmax(lengths))]
-        onset = starts[si] / fs
-        offset = (starts[ei] + windows.shape[2]) / fs
-        conf = float(probs[si:ei + 1].mean())
-
-        return {
-            "seizure_present": 1,
-            "seizure_confidence": conf,
-            "onset": onset,
-            "onset_confidence": conf,
-            "offset": offset,
-            "offset_confidence": conf
-        }
-
+            
     except Exception as e:
-        print(f"Error in prediction: {e}")
+        print(f"Prediction error: {str(e)}")
         return {
             "seizure_present": 0,
             "seizure_confidence": 0.0,
