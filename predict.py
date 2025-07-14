@@ -89,7 +89,7 @@ def normalize_window(window):
     return normalized
 
 # ========== Prediction Function ==========
-def predict_labels(channels, data, fs, model_name='best_model.pth'):
+def predict_labels(channels, data, fs, reference_system, model_name='best_model.pth'):
     # Constants
     TARGET_FS = fs  # use original sampling frequency
     WINDOW_DURATION = 300   # 5 minutes
