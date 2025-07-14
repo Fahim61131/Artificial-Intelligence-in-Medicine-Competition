@@ -63,12 +63,10 @@ class SeizureModel(torch.nn.Module):
 
 # ========== Preprocessing Functions ==========
 def preprocess_signal(channels, data, fs):
-    """Apply montages and filters, keep original sampling frequency"""
     _, montage_data, is_missing = get_3montages(channels, data)
     if is_missing:
         return None
 
-    # Notch + bandpass filtering
     for i in range(montage_data.shape[0]):
         montage_data[i] = mne.filter.notch_filter(
             x=montage_data[i], Fs=fs, freqs=[50.0, 100.0], verbose=False
@@ -76,11 +74,9 @@ def preprocess_signal(channels, data, fs):
         montage_data[i] = mne.filter.filter_data(
             data=montage_data[i], sfreq=fs, l_freq=0.5, h_freq=70.0, verbose=False
         )
-
     return montage_data
 
 def normalize_window(window):
-    """Channel-wise normalization"""
     normalized = np.zeros_like(window)
     for i in range(window.shape[0]):
         ch = window[i]
@@ -90,62 +86,69 @@ def normalize_window(window):
 
 # ========== Prediction Function ==========
 def predict_labels(channels, data, fs, reference_system, model_name='best_model.pth'):
-    # Constants
-    TARGET_FS = fs  # use original sampling frequency
-    WINDOW_DURATION = 300   # 5 minutes
-    STRIDE_DURATION = 30    # 30s
-    SAMPLES_PER_WINDOW = WINDOW_DURATION * TARGET_FS
-    SAMPLES_PER_STRIDE = STRIDE_DURATION * TARGET_FS
+    fs = int(fs)
+    WINDOW_DURATION_SEC = 300  # 5 minutes
+    STRIDE_DURATION_SEC = 30
+    SAMPLES_PER_WINDOW = WINDOW_DURATION_SEC * fs
+    SAMPLES_PER_STRIDE = STRIDE_DURATION_SEC * fs
 
-    # Preprocess entire signal
     montage_data = preprocess_signal(channels, data, fs)
     if montage_data is None:
-        return {"seizure_present":0, "seizure_confidence":0.0,
-                "onset":None, "onset_confidence":0.0,
-                "offset":None, "offset_confidence":0.0}
+        return {
+            "seizure_present": 0,
+            "seizure_confidence": 0.0,
+            "onset": None, "onset_confidence": 0.0,
+            "offset": None, "offset_confidence": 0.0
+        }
 
     n_samples = montage_data.shape[1]
-    original_duration = n_samples / fs
-
-    # Load model
     model = SeizureModel().to(device)
     model.load_state_dict(torch.load(model_name, map_location=device))
     model.eval()
 
-    max_prob = 0.0
-    best_onset = best_offset = None
+    best_prob = 0.0
+    best_onset = None
+    best_offset = None
 
-    # Slide window
     for start in range(0, n_samples, SAMPLES_PER_STRIDE):
         end = start + SAMPLES_PER_WINDOW
         if end > n_samples:
             window = montage_data[:, start:]
             pad = end - n_samples
-            window = np.pad(window, ((0,0),(0,pad)), mode='constant')
+            window = np.pad(window, ((0, 0), (0, pad)), mode='constant')
         else:
             window = montage_data[:, start:end]
 
-        win_norm = normalize_window(window)
-        inp = torch.tensor(win_norm, dtype=torch.float32).unsqueeze(0).to(device)
+        window = normalize_window(window)
+        x = torch.tensor(window, dtype=torch.float32).unsqueeze(0).to(device)
 
         with torch.no_grad():
-            prob, reg = model(inp)
+            prob, reg = model(x)
             p = prob.item()
-            if p > max_prob:
-                max_prob = p
+
+            if p > best_prob:
+                best_prob = p
                 if p > 0.5:
                     onset_rel, offset_rel = reg.squeeze().cpu().numpy()
-                    wstart = start / fs
-                    o = np.clip(onset_rel, 0, 1)*WINDOW_DURATION + wstart
-                    f = np.clip(offset_rel, 0, 1)*WINDOW_DURATION + wstart
-                    best_onset = min(o, original_duration)
-                    best_offset = min(f, original_duration)
+                    window_start_time = start / fs
+                    best_onset = onset_rel * WINDOW_DURATION_SEC + window_start_time
+                    best_offset = offset_rel * WINDOW_DURATION_SEC + window_start_time
 
-    if max_prob > 0.5:
-        return {"seizure_present":1, "seizure_confidence":max_prob,
-                "onset":float(best_onset), "onset_confidence":1.0,
-                "offset":float(best_offset), "offset_confidence":1.0}
+    if best_prob > 0.5:
+        return {
+            "seizure_present": 1,
+            "seizure_confidence": best_prob,
+            "onset": float(best_onset),
+            "onset_confidence": 1.0,
+            "offset": float(best_offset),
+            "offset_confidence": 1.0
+        }
     else:
-        return {"seizure_present":0, "seizure_confidence":max_prob,
-                "onset":None,    "onset_confidence":0.0,
-                "offset":None,   "offset_confidence":0.0}
+        return {
+            "seizure_present": 0,
+            "seizure_confidence": best_prob,
+            "onset": None,
+            "onset_confidence": 0.0,
+            "offset": None,
+            "offset_confidence": 0.0
+        }
