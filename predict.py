@@ -65,7 +65,7 @@ def apply_filters(signal, b_bp, a_bp, b_notch, a_notch):
 
 def predict_labels(channels, data, fs, reference_system, model_name='model_combined.pth'):
     """
-    Predicts seizure presence and onset/offset for 120s EEG window.
+    Predicts seizure presence and onset/offset for full EEG using sliding 120s windows with 20s stride.
     """
     # Load model
     model = EEGClassifierRegressor()
@@ -80,43 +80,55 @@ def predict_labels(channels, data, fs, reference_system, model_name='model_combi
     b_bp, a_bp, b_notch, a_notch = create_filters(fs)
     filtered = apply_filters(montage_data, b_bp, a_bp, b_notch, a_notch)
 
-    # Take 120s window from start
     fs = int(fs)
     window_samples = 120 * fs
-    segment = filtered[:window_samples]
+    stride_samples = 20 * fs
+    total_samples = filtered.shape[0]
 
-    if segment.shape[0] < window_samples:
-        segment = np.pad(segment, ((0, window_samples - segment.shape[0]), (0, 0)), mode='constant')
+    global_onsets = []
+    global_offsets = []
+    seizure_confidences = []
 
-    # Normalize
-    segment = segment.T  # (3, 30000)
-    segment = (segment - segment.mean(axis=1, keepdims=True)) / (segment.std(axis=1, keepdims=True) + 1e-6)
+    for start in range(0, total_samples - window_samples + 1, stride_samples):
+        segment = filtered[start:start + window_samples]
 
-    # Inference
-    x_input = torch.tensor(segment).unsqueeze(0).float()  # (1, 3, 30000)
-    with torch.no_grad():
-        cls_out, reg_out = model(x_input)
-        seizure_prob = torch.sigmoid(cls_out).item()
-        seizure_present = int(seizure_prob > 0.5)
+        if segment.shape[0] < window_samples:
+            segment = np.pad(segment, ((0, window_samples - segment.shape[0]), (0, 0)), mode='constant')
 
-        if seizure_present:
-            onset, offset = reg_out.squeeze().tolist()
-            prediction = {
-                "seizure_present": 1,
-                "seizure_confidence": seizure_prob,
-                "onset": float(onset),
-                "onset_confidence": 1.0,
-                "offset": float(offset),
-                "offset_confidence": 1.0
-            }
-        else:
-            prediction = {
-                "seizure_present": 0,
-                "seizure_confidence": seizure_prob,
-                "onset": None,
-                "onset_confidence": 0.0,
-                "offset": None,
-                "offset_confidence": 0.0
-            }
+        # Normalize
+        segment = segment.T  # (3, 30000)
+        segment = (segment - segment.mean(axis=1, keepdims=True)) / (segment.std(axis=1, keepdims=True) + 1e-6)
+
+        # Inference
+        x_input = torch.tensor(segment).unsqueeze(0).float()  # (1, 3, 30000)
+        with torch.no_grad():
+            cls_out, reg_out = model(x_input)
+            seizure_prob = torch.sigmoid(cls_out).item()
+            seizure_present = int(seizure_prob > 0.5)
+
+            if seizure_present:
+                onset, offset = reg_out.squeeze().tolist()
+                global_onsets.append(start / fs + onset)
+                global_offsets.append(start / fs + offset)
+                seizure_confidences.append(seizure_prob)
+
+    if global_onsets:
+        prediction = {
+            "seizure_present": 1,
+            "seizure_confidence": max(seizure_confidences),
+            "onset": float(min(global_onsets)),
+            "onset_confidence": 1.0,
+            "offset": float(max(global_offsets)),
+            "offset_confidence": 1.0
+        }
+    else:
+        prediction = {
+            "seizure_present": 0,
+            "seizure_confidence": 0.0,
+            "onset": None,
+            "onset_confidence": 0.0,
+            "offset": None,
+            "offset_confidence": 0.0
+        }
 
     return prediction
