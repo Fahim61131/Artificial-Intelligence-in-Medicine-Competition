@@ -66,6 +66,7 @@ def apply_filters(signal, b_bp, a_bp, b_notch, a_notch):
 def predict_labels(channels, data, fs, reference_system, model_name='model_combined.pth'):
     """
     Predicts seizure presence and onset/offset for full EEG using sliding 120s windows with 20s stride.
+    Applies minimum confidence and vote filtering to reduce false positives.
     """
     # Load model
     model = EEGClassifierRegressor()
@@ -96,23 +97,22 @@ def predict_labels(channels, data, fs, reference_system, model_name='model_combi
             segment = np.pad(segment, ((0, window_samples - segment.shape[0]), (0, 0)), mode='constant')
 
         # Normalize
-        segment = segment.T  # (3, 30000)
+        segment = segment.T  # (3, window_samples)
         segment = (segment - segment.mean(axis=1, keepdims=True)) / (segment.std(axis=1, keepdims=True) + 1e-6)
 
         # Inference
-        x_input = torch.tensor(segment).unsqueeze(0).float()  # (1, 3, 30000)
+        x_input = torch.tensor(segment).unsqueeze(0).float()  # (1, 3, window_samples)
         with torch.no_grad():
             cls_out, reg_out = model(x_input)
             seizure_prob = torch.sigmoid(cls_out).item()
-            seizure_present = int(seizure_prob > 0.5)
-
-            if seizure_present:
+            if seizure_prob > 0.5:
                 onset, offset = reg_out.squeeze().tolist()
                 global_onsets.append(start / fs + onset)
                 global_offsets.append(start / fs + offset)
                 seizure_confidences.append(seizure_prob)
 
-    if global_onsets:
+    # Filtering rule: need at least 2 confident seizure windows
+    if len(global_onsets) >= 2 and max(seizure_confidences) > 0.6:
         prediction = {
             "seizure_present": 1,
             "seizure_confidence": max(seizure_confidences),
@@ -124,7 +124,7 @@ def predict_labels(channels, data, fs, reference_system, model_name='model_combi
     else:
         prediction = {
             "seizure_present": 0,
-            "seizure_confidence": 0.0,
+            "seizure_confidence": max(seizure_confidences) if seizure_confidences else 0.0,
             "onset": None,
             "onset_confidence": 0.0,
             "offset": None,
@@ -132,3 +132,4 @@ def predict_labels(channels, data, fs, reference_system, model_name='model_combi
         }
 
     return prediction
+
