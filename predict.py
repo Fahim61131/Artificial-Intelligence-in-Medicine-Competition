@@ -1,123 +1,236 @@
 import os
+import json
+from typing import List, Dict, Any
+
 import numpy as np
 import torch
 import torch.nn as nn
-from typing import List, Dict, Any
 import mne
-from scipy.signal import welch
-from scipy.stats import skew, kurtosis
 from wettbewerb import get_6montages
 
-# Base directory for data and model
+MODEL_PATH = "best_model_2.pth"
 
-MODEL_PATH = "best_model.pth"
 
-# EEG frequency bands
-eeg_bands = {
-    'delta': (0.5, 4),
-    'theta': (4, 8),
-    'alpha': (8, 12),
-    'beta':  (12, 30),
-    'gamma': (30, 70)
-}
 
-# Compute power in a frequency band
-def compute_bandpower(sig: np.ndarray, fs: float, band: tuple) -> float:
-    fmin, fmax = band
-    freqs, psd = welch(sig, fs=fs, nperseg=min(2048, len(sig)))
-    mask = (freqs >= fmin) & (freqs <= fmax)
-    return np.trapz(psd[mask], freqs[mask])
-
-# Extract features: band powers + basic stats
-def extract_features(data: np.ndarray, fs: float) -> np.ndarray:
-    feats = []
-    for ch in data:
-        for band in eeg_bands.values():
-            feats.append(compute_bandpower(ch, fs, band))
-        feats.extend([
-            np.mean(ch),
-            np.std(ch),
-            np.sqrt(np.mean(ch**2)),
-            skew(ch),
-            kurtosis(ch)
-        ])
-    return np.array(feats, dtype=np.float32)
-
-# Neural network matching training architecture
-class ClassifierRegressor(nn.Module):
-    def __init__(self, input_dim: int):
-        super().__init__()
-        self.shared = nn.Sequential(
-            nn.Linear(input_dim, 128), nn.ReLU(),
-            nn.Linear(128, 64), nn.ReLU()
+# -----------------------------------------------------------------------------
+# 1) Model definition
+# -----------------------------------------------------------------------------
+class SeizureModel(nn.Module):
+    def __init__(self):
+        super(SeizureModel, self).__init__()
+        
+        # Normalization layer at the start
+        self.norm = nn.InstanceNorm1d(6, affine=True)
+        
+        # Enhanced convolutional layers with residual connections
+        self.conv1 = nn.Sequential(
+            nn.Conv1d(6, 64, kernel_size=25, stride=3, padding=12),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.MaxPool1d(3),
+            nn.Dropout(0.2)
         )
-        self.cls_head = nn.Linear(64, 1)
-        self.reg_head = nn.Linear(64, 2)
+        
+        self.conv2 = nn.Sequential(
+            nn.Conv1d(64, 128, kernel_size=15, stride=2, padding=7),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Dropout(0.3)
+        )
+        
+        self.conv3 = nn.Sequential(
+            nn.Conv1d(128, 256, kernel_size=7, stride=2, padding=3),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Dropout(0.3)
+        )
+        
+        self.conv4 = nn.Sequential(
+            nn.Conv1d(256, 512, kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Dropout(0.4)
+        )
+        
+        # Residual connections
+        self.residual1 = nn.Conv1d(64, 128, kernel_size=1, stride=2)
+        self.residual2 = nn.Conv1d(128, 256, kernel_size=1, stride=2)
+        self.residual3 = nn.Conv1d(256, 512, kernel_size=1, stride=2)
+        
+        # LSTM layers with layer normalization
+        self.lstm = nn.LSTM(
+            input_size=512,
+            hidden_size=256,
+            num_layers=3,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.4
+        )
+        
+        # Layer normalization after LSTM
+        self.ln = nn.LayerNorm(512)
+        
+        # Attention mechanism
+        self.attention = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.Tanh(),
+            nn.Linear(256, 1),
+            nn.Softmax(dim=1)
+        )
+        
+        # Classification head
+        self.class_head = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(128, 1),
+            nn.Sigmoid()
+        )
+
+        # Regression head
+        self.reg_head = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2)
+        )
 
     def forward(self, x):
-        x = self.shared(x)
-        cls_out = torch.sigmoid(self.cls_head(x)).squeeze(1)
+        # Apply instance normalization
+        x = self.norm(x)
+        
+        # Convolutional layers with residual connections
+        x1 = self.conv1(x)
+        
+        x2 = self.conv2(x1)
+        res1 = self.residual1(x1)
+        x2 = x2 + res1[:, :, :x2.size(2)]  # Match dimensions
+        
+        x3 = self.conv3(x2)
+        res2 = self.residual2(x2)
+        x3 = x3 + res2[:, :, :x3.size(2)]
+        
+        x4 = self.conv4(x3)
+        res3 = self.residual3(x3)
+        x4 = x4 + res3[:, :, :x4.size(2)]
+        
+        # Prepare for LSTM - swap dimensions
+        x = x4.permute(0, 2, 1)
+        
+        # LSTM layers
+        x, _ = self.lstm(x)
+        
+        # Apply layer normalization
+        x = self.ln(x)
+        
+        # Attention mechanism
+        attn_weights = self.attention(x)
+        x = torch.sum(attn_weights * x, dim=1)
+        
+        # Classification output
+        class_out = self.class_head(x)
+        
+        # Regression output
         reg_out = self.reg_head(x)
-        return cls_out, reg_out
+        
+        return class_out, reg_out
+# -----------------------------------------------------------------------------
+# 2) Prediction function
+# -----------------------------------------------------------------------------
+def predict_labels(
+    channels: List[str],
+    data: np.ndarray,
+    fs: float,
+    reference_system: str,
+    model_name: str = 'best_model_2.pth'
+) -> Dict[str, Any]:
+    """
+    Slides 75k-sample windows with 5k stride over montage data,
+    normalizes each window, then classifies and aggregates predictions
+    into a single global onset/offset if >=3 consecutive windows are positive.
+    Returns seizure metrics plus the raw list of window probabilities.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Load model from shared directory
-def load_model(path: str, input_dim: int) -> ClassifierRegressor:
-    model = ClassifierRegressor(input_dim)
-    state = torch.load(path, map_location='cpu')
-    model.load_state_dict(state)
+    # Build 6-montage and filter
+    labels, montage, missing = get_6montages(channels, data)
+    for i in range(montage.shape[0]):
+        sig = montage[i]
+        montage[i] = mne.filter.notch_filter(sig, Fs=fs, freqs=[50.0], verbose=False)
+        montage[i] = mne.filter.filter_data(
+            montage[i], sfreq=fs, l_freq=0.5, h_freq=70.0, verbose=False
+        )
+
+    # Load model
+    model = SeizureModel().to(device)
+    model.load_state_dict(torch.load(model_name, map_location=device))
     model.eval()
-    return model
 
-# Prediction function (do not change signature)
-def predict_labels(channels: List[str], data: np.ndarray, fs: float,
-                   reference_system: str, model_name: str = MODEL_PATH) -> Dict[str, Any]:
-    """
-    Predicts seizure presence and onset/offset times.
+    # Slide windows & predict
+    W = 75000
+    S = 5000
+    L = montage.shape[1]
+    probs, positions = [], []
+    with torch.no_grad():
+        for start in range(0, L - W + 1, S):
+            window = montage[:, start:start+W]
+            x = torch.from_numpy(window).unsqueeze(0).float().to(device)
+            p, _ = model(x)
+            probs.append(float(p.item()))
+            positions.append(start)
 
-    Returns a dict with keys:
-      seizure_present (bool)
-      seizure_confidence (float)
-      onset (float)
-      onset_confidence (float)
-      offset (float)
-      offset_confidence (float)
-    """
-    montage, mont_data, missing = get_6montages(channels, data)
-    if missing:
+    # Binarize
+    flags = [1 if p > 0.5 else 0 for p in probs]
+
+    # Find clusters of >=3 consecutive positives
+    clusters, run = [], []
+    for idx, f in enumerate(flags):
+        if f:
+            run.append(idx)
+        else:
+            if len(run) >= 3:
+                clusters.append((run[0], run[-1]))
+            run = []
+    if len(run) >= 3:
+        clusters.append((run[0], run[-1]))
+
+    # No seizure
+    if not clusters:
         return {
             'seizure_present': False,
             'seizure_confidence': 0.0,
             'onset': 0.0,
             'onset_confidence': 0.0,
             'offset': 0.0,
-            'offset_confidence': 0.0
+            'offset_confidence': 0.0,
         }
 
-    # Apply notch and bandpass filters
-    for i in range(len(mont_data)):
-        mont_data[i] = mne.filter.notch_filter(
-            mont_data[i], Fs=fs, freqs=[50, 100], verbose=False
-        )
-        mont_data[i] = mne.filter.filter_data(
-            mont_data[i], sfreq=fs, l_freq=0.5, h_freq=70, verbose=False
-        )
-
-    # Extract features
-    feats = extract_features(mont_data, fs)
-    # Load and run model
-    model = load_model(model_name, len(feats))
-    x = torch.from_numpy(feats).unsqueeze(0)
-    with torch.no_grad():
-        prob, locs = model(x)
-
-    prob = prob.item()
-    onset, offset = locs[0].tolist()
+    # Global onset/offset
+    first, last = clusters[0][0], clusters[-1][1]
+    s_on = positions[first]
+    s_off = positions[last] + W
+    s_off = min(s_off, L)
+    onset = s_on / fs
+    offset = s_off / fs
+    conf = sum(probs[first:last+1]) / (last - first + 1)
 
     return {
-        'seizure_present': prob > 0.5,
-        'seizure_confidence': prob,
-        'onset': float(onset),
-        'onset_confidence': 1.0,
-        'offset': float(offset),
-        'offset_confidence': 1.0
+        'seizure_present': True,
+        'seizure_confidence': conf,
+        'onset': onset,
+        'onset_confidence': conf,
+        'offset': offset,
+        'offset_confidence': conf,
+
     }
