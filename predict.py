@@ -8,7 +8,7 @@ import torch.nn as nn
 import mne
 from wettbewerb import get_6montages
 
-
+WINDOW_SAMPLES = 75000
 
 # -----------------------------------------------------------------------------
 # 1) Model definition
@@ -146,19 +146,8 @@ class SeizureModel(nn.Module):
 # -----------------------------------------------------------------------------
 # 2) Prediction function
 # -----------------------------------------------------------------------------
-def predict_labels(
-    channels: List[str],
-    data: np.ndarray,
-    fs: float,
-    reference_system: str,
-    model_name: str = "best_model_2.pth"
-) -> Dict[str, Any]:
-    """
-    Slides 75k-sample windows with 5k stride over montage data,
-    normalizes each window, then classifies and aggregates predictions
-    into a single global onset/offset if >=3 consecutive windows are positive.
-    Returns seizure metrics plus the raw list of window probabilities.
-    """
+def predict_labels(channels: List[str],data: np.ndarray,fs: float,reference_system: str,model_name: str = "best_model_2.pth") -> Dict[str, Any]:
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Build 6-montage and filter
@@ -180,7 +169,7 @@ def predict_labels(
         window = np.pad(montage, ((0,0),(0,pad)), mode='constant')
 
     # --- tensorize ---
-    x = torch.from_numpy(window).unsqueeze(0).float().to(device)
+    x = torch.tensor(window).unsqueeze(0).float().to(device)
 
     # --- load model & forward ---
     model = SeizureModel().to(device)
@@ -213,3 +202,4 @@ def predict_labels(
             }
 
     return prediction
+
