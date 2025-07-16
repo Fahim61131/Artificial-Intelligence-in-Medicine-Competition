@@ -8,7 +8,9 @@ from scipy.signal import welch
 from scipy.stats import skew, kurtosis
 from wettbewerb import get_6montages
 
+# Base directory for data and model
 
+MODEL_PATH = "best_model.pth"
 
 # EEG frequency bands
 eeg_bands = {
@@ -41,12 +43,13 @@ def extract_features(data: np.ndarray, fs: float) -> np.ndarray:
         ])
     return np.array(feats, dtype=np.float32)
 
-# Neural network matching training architecture\ class ClassifierRegressor(nn.Module):
+# Neural network matching training architecture
+class ClassifierRegressor(nn.Module):
     def __init__(self, input_dim: int):
-        super(ClassifierRegressor, self).__init__()
+        super().__init__()
         self.shared = nn.Sequential(
             nn.Linear(input_dim, 128), nn.ReLU(),
-            nn.Linear(128, 64),  nn.ReLU()
+            nn.Linear(128, 64), nn.ReLU()
         )
         self.cls_head = nn.Linear(64, 1)
         self.reg_head = nn.Linear(64, 2)
@@ -58,7 +61,7 @@ def extract_features(data: np.ndarray, fs: float) -> np.ndarray:
         return cls_out, reg_out
 
 # Load model from shared directory
-def load_model(path: str, input_dim: int):
+def load_model(path: str, input_dim: int) -> ClassifierRegressor:
     model = ClassifierRegressor(input_dim)
     state = torch.load(path, map_location='cpu')
     model.load_state_dict(state)
@@ -67,7 +70,7 @@ def load_model(path: str, input_dim: int):
 
 # Prediction function (do not change signature)
 def predict_labels(channels: List[str], data: np.ndarray, fs: float,
-                   reference_system: str, model_name: str = "best_model.pth") -> Dict[str, Any]:
+                   reference_system: str, model_name: str = MODEL_PATH) -> Dict[str, Any]:
     """
     Predicts seizure presence and onset/offset times.
 
@@ -81,23 +84,40 @@ def predict_labels(channels: List[str], data: np.ndarray, fs: float,
     """
     montage, mont_data, missing = get_6montages(channels, data)
     if missing:
-        return {k: 0.0 if isinstance(k, float) else False for k in ['seizure_present','seizure_confidence','onset','onset_confidence','offset','offset_confidence']}
+        return {
+            'seizure_present': False,
+            'seizure_confidence': 0.0,
+            'onset': 0.0,
+            'onset_confidence': 0.0,
+            'offset': 0.0,
+            'offset_confidence': 0.0
+        }
 
+    # Apply notch and bandpass filters
     for i in range(len(mont_data)):
-        mont_data[i] = mne.filter.notch_filter(mont_data[i], Fs=fs, freqs=[50,100], verbose=False)
-        mont_data[i] = mne.filter.filter_data(mont_data[i], sfreq=fs, l_freq=0.5, h_freq=70, verbose=False)
+        mont_data[i] = mne.filter.notch_filter(
+            mont_data[i], Fs=fs, freqs=[50, 100], verbose=False
+        )
+        mont_data[i] = mne.filter.filter_data(
+            mont_data[i], sfreq=fs, l_freq=0.5, h_freq=70, verbose=False
+        )
 
+    # Extract features
     feats = extract_features(mont_data, fs)
+    # Load and run model
     model = load_model(model_name, len(feats))
     x = torch.from_numpy(feats).unsqueeze(0)
     with torch.no_grad():
         prob, locs = model(x)
+
     prob = prob.item()
     onset, offset = locs[0].tolist()
 
     return {
         'seizure_present': prob > 0.5,
         'seizure_confidence': prob,
-        'onset': float(onset), 'onset_confidence': 1.0,
-        'offset': float(offset), 'offset_confidence': 1.0
+        'onset': float(onset),
+        'onset_confidence': 1.0,
+        'offset': float(offset),
+        'offset_confidence': 1.0
     }
