@@ -190,7 +190,7 @@ def predict_labels(
     with torch.no_grad():
         p_cls, p_reg = model(x)
         seizure_prob = torch.sigmoid(p_cls).item()
-        seizure_present = int(seizure_prob > 0.5)
+        seizure_present = int(seizure_prob > 0.7)
 
         if seizure_present:
             onset, offset = p_reg.squeeze().tolist()
