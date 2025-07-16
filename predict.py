@@ -8,8 +8,6 @@ import torch.nn as nn
 import mne
 from wettbewerb import get_6montages
 
-MODEL_PATH = "best_model_2.pth"
-
 
 
 # -----------------------------------------------------------------------------
