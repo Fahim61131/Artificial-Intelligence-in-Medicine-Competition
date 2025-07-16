@@ -107,7 +107,8 @@ def predict_labels(
 
     # load & run model
     model = SeizureModel().to(device)
-    model.load_state_dict(torch.load(model_name, map_location=device))
+    state = torch.load(model_name, map_location=device)
+    model.load_state_dict(state, strict=False)
     model.eval()
     with torch.no_grad():
         p_cls, p_reg = model(x)
