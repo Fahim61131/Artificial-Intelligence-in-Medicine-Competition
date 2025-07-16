@@ -153,7 +153,7 @@ def predict_labels(
     data: np.ndarray,
     fs: float,
     reference_system: str,
-    model_name: str = MODEL_PATH
+    model_name: str = "best_model_2.pth"
 ) -> Dict[str, Any]:
     """
     Slides 75k-sample windows with 5k stride over montage data,
@@ -191,25 +191,27 @@ def predict_labels(
     model.eval()
     with torch.no_grad():
         p_cls, p_reg = model(x)
-        prob = float(p_cls.item())
-        onset, offset = float(p_reg[0,0].item()), float(p_reg[0,1].item())
+        seizure_prob = torch.sigmoid(p_cls).item()
+        seizure_present = int(seizure_prob > 0.5)
 
-    # --- return exactly as before ---
-    if prob > 0.5:
-        return {
-            'seizure_present': True,
-            'seizure_confidence': prob,
-            'onset': onset,
-            'onset_confidence': 1.0,
-            'offset': offset,
-            'offset_confidence': 1.0
-        }
-    else:
-        return {
-            'seizure_present': False,
-            'seizure_confidence': prob,
-            'onset': 0.0,
-            'onset_confidence': 0.0,
-            'offset': 0.0,
-            'offset_confidence': 0.0
-        }
+        if seizure_present:
+            onset, offset = p_reg.squeeze().tolist()
+            prediction = {
+                "seizure_present": 1,
+                "seizure_confidence": seizure_prob,
+                "onset": float(onset),
+                "onset_confidence": 1.0,
+                "offset": float(offset),
+                "offset_confidence": 1.0
+            }
+        else:
+            prediction = {
+                "seizure_present": 0,
+                "seizure_confidence": seizure_prob,
+                "onset": None,
+                "onset_confidence": 0.0,
+                "offset": None,
+                "offset_confidence": 0.0
+            }
+
+    return prediction
