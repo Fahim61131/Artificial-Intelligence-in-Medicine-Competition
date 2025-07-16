@@ -143,6 +143,7 @@ class SeizureModel(nn.Module):
         reg_out = self.reg_head(x)
         
         return class_out, reg_out
+
 # -----------------------------------------------------------------------------
 # 2) Prediction function
 # -----------------------------------------------------------------------------
@@ -150,7 +151,7 @@ def predict_labels(channels: List[str],data: np.ndarray,fs: float,reference_syst
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Build 6-montage and filter
+    # Build 6‑montage and filter
     labels, montage, missing = get_6montages(channels, data)
     for i in range(montage.shape[0]):
         sig = montage[i]
@@ -159,47 +160,69 @@ def predict_labels(channels: List[str],data: np.ndarray,fs: float,reference_syst
             montage[i], sfreq=fs, l_freq=0.5, h_freq=70.0, verbose=False
         )
 
+    # ─── pad to ensure at least one full WINDOW_SAMPLES chunk ───
+    W = WINDOW_SAMPLES
+    if montage.shape[1] < W:
+        pad_len = W - montage.shape[1]
+        montage = np.pad(montage, ((0,0),(0,pad_len)), mode='constant')
 
-    # --- new logic: cut or pad to WINDOW_SAMPLES ---
-    n = montage.shape[1]
-    if n >= WINDOW_SAMPLES:
-        window = montage[:, :WINDOW_SAMPLES]
-    else:
-        pad = WINDOW_SAMPLES - n
-        window = np.pad(montage, ((0,0),(0,pad)), mode='constant')
+    # now slice into non‑overlapping WINDOW_SAMPLES chunks
+    L = montage.shape[1]
+    n_windows = L // W
 
-    # --- tensorize ---
-    x = torch.tensor(window).unsqueeze(0).float().to(device)
-
-    # --- load model & forward ---
+    # load & run model on each chunk
     model = SeizureModel().to(device)
     state = torch.load(model_name, map_location=device)
     model.load_state_dict(state, strict=False)
     model.eval()
+
+    probs = []
+    onsets_rel = []
+    offsets_rel = []
+    positions = []
+
     with torch.no_grad():
-        p_cls, p_reg = model(x)
-        seizure_prob = torch.sigmoid(p_cls).item()
-        seizure_present = int(seizure_prob > 0.7)
+        for w in range(n_windows):
+            start = w * W
+            chunk = montage[:, start:start+W]
+            x_chunk = torch.tensor(chunk).unsqueeze(0).float().to(device)
+            p_cls, p_reg = model(x_chunk)
+            prob = float(torch.sigmoid(p_cls).item())
+            onset_rel, offset_rel = p_reg.squeeze().tolist()
 
-        if seizure_present:
-            onset, offset = p_reg.squeeze().tolist()
-            prediction = {
-                "seizure_present": 1,
-                "seizure_confidence": seizure_prob,
-                "onset": float(onset),
-                "onset_confidence": 1.0,
-                "offset": float(offset),
-                "offset_confidence": 1.0
-            }
-        else:
-            prediction = {
-                "seizure_present": 0,
-                "seizure_confidence": seizure_prob,
-                "onset": None,
-                "onset_confidence": 0.0,
-                "offset": None,
-                "offset_confidence": 0.0
-            }
+            probs.append(prob)
+            onsets_rel.append(onset_rel)
+            offsets_rel.append(offset_rel)
+            positions.append(start)
 
-    return prediction
+
+    first_prob = probs[0]
+    seizure_present = int(first_prob > 0.7)
+
+    if not seizure_present:
+        return {
+            "seizure_present": 0,
+            "seizure_confidence": first_prob,
+            "onset": None,
+            "onset_confidence": 0.0,
+            "offset": None,
+            "offset_confidence": 0.0
+        }
+
+    
+    first_idx = 0
+    last_idx  = len(probs) - 1
+
+    global_onset  = positions[first_idx] / fs + onsets_rel[first_idx]
+    global_offset = positions[last_idx]  / fs + offsets_rel[last_idx]
+    conf = first_prob
+
+    return {
+        "seizure_present":       1,
+        "seizure_confidence":    conf,
+        "onset":                 float(global_onset),
+        "onset_confidence":      1.0,
+        "offset":                float(global_offset),
+        "offset_confidence":     1.0
+    }
 
