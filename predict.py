@@ -9,228 +9,127 @@ import mne
 from wettbewerb import get_6montages
 
 MODEL_PATH = "best_model_2.pth"
-
-
+WINDOW_SAMPLES = 75000  # first 5 min at 250 Hz
 
 # -----------------------------------------------------------------------------
-# 1) Model definition
+# 1) Model definition (unchanged)
 # -----------------------------------------------------------------------------
 class SeizureModel(nn.Module):
     def __init__(self):
         super(SeizureModel, self).__init__()
-        
-        # Normalization layer at the start
         self.norm = nn.InstanceNorm1d(6, affine=True)
-        
-        # Enhanced convolutional layers with residual connections
         self.conv1 = nn.Sequential(
-            nn.Conv1d(6, 64, kernel_size=25, stride=3, padding=12),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.MaxPool1d(3),
-            nn.Dropout(0.2)
+            nn.Conv1d(6, 64, 25, stride=3, padding=12),
+            nn.BatchNorm1d(64), nn.ReLU(), nn.MaxPool1d(3), nn.Dropout(0.2)
         )
-        
         self.conv2 = nn.Sequential(
-            nn.Conv1d(64, 128, kernel_size=15, stride=2, padding=7),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.MaxPool1d(2),
-            nn.Dropout(0.3)
+            nn.Conv1d(64, 128, 15, stride=2, padding=7),
+            nn.BatchNorm1d(128), nn.ReLU(), nn.MaxPool1d(2), nn.Dropout(0.3)
         )
-        
         self.conv3 = nn.Sequential(
-            nn.Conv1d(128, 256, kernel_size=7, stride=2, padding=3),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.MaxPool1d(2),
-            nn.Dropout(0.3)
+            nn.Conv1d(128, 256, 7, stride=2, padding=3),
+            nn.BatchNorm1d(256), nn.ReLU(), nn.MaxPool1d(2), nn.Dropout(0.3)
         )
-        
         self.conv4 = nn.Sequential(
-            nn.Conv1d(256, 512, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm1d(512),
-            nn.ReLU(),
-            nn.MaxPool1d(2),
-            nn.Dropout(0.4)
+            nn.Conv1d(256, 512, 5, stride=2, padding=2),
+            nn.BatchNorm1d(512), nn.ReLU(), nn.MaxPool1d(2), nn.Dropout(0.4)
         )
-        
-        # Residual connections
-        self.residual1 = nn.Conv1d(64, 128, kernel_size=1, stride=2)
-        self.residual2 = nn.Conv1d(128, 256, kernel_size=1, stride=2)
-        self.residual3 = nn.Conv1d(256, 512, kernel_size=1, stride=2)
-        
-        # LSTM layers with layer normalization
-        self.lstm = nn.LSTM(
-            input_size=512,
-            hidden_size=256,
-            num_layers=3,
-            batch_first=True,
-            bidirectional=True,
-            dropout=0.4
-        )
-        
-        # Layer normalization after LSTM
+        self.res1 = nn.Conv1d(64, 128, 1, stride=2)
+        self.res2 = nn.Conv1d(128, 256, 1, stride=2)
+        self.res3 = nn.Conv1d(256, 512, 1, stride=2)
+        self.lstm = nn.LSTM(512, 256, num_layers=3,
+                            bidirectional=True, batch_first=True, dropout=0.4)
         self.ln = nn.LayerNorm(512)
-        
-        # Attention mechanism
-        self.attention = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.Tanh(),
-            nn.Linear(256, 1),
-            nn.Softmax(dim=1)
+        self.attn = nn.Sequential(
+            nn.Linear(512, 256), nn.Tanh(),
+            nn.Linear(256, 1), nn.Softmax(dim=1)
         )
-        
-        # Classification head
         self.class_head = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(128, 1),
-            nn.Sigmoid()
+            nn.Linear(512,256), nn.ReLU(), nn.Dropout(0.5),
+            nn.Linear(256,128), nn.ReLU(), nn.Dropout(0.4),
+            nn.Linear(128,1), nn.Sigmoid()
         )
-
-        # Regression head
         self.reg_head = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 2)
+            nn.Linear(512,256), nn.ReLU(), nn.Dropout(0.5),
+            nn.Linear(256,128), nn.ReLU(), nn.Dropout(0.4),
+            nn.Linear(128,64), nn.ReLU(), nn.Linear(64,2)
         )
 
     def forward(self, x):
-        # Apply instance normalization
         x = self.norm(x)
-        
-        # Convolutional layers with residual connections
         x1 = self.conv1(x)
-        
-        x2 = self.conv2(x1)
-        res1 = self.residual1(x1)
-        x2 = x2 + res1[:, :, :x2.size(2)]  # Match dimensions
-        
-        x3 = self.conv3(x2)
-        res2 = self.residual2(x2)
-        x3 = x3 + res2[:, :, :x3.size(2)]
-        
-        x4 = self.conv4(x3)
-        res3 = self.residual3(x3)
-        x4 = x4 + res3[:, :, :x4.size(2)]
-        
-        # Prepare for LSTM - swap dimensions
-        x = x4.permute(0, 2, 1)
-        
-        # LSTM layers
-        x, _ = self.lstm(x)
-        
-        # Apply layer normalization
-        x = self.ln(x)
-        
-        # Attention mechanism
-        attn_weights = self.attention(x)
-        x = torch.sum(attn_weights * x, dim=1)
-        
-        # Classification output
-        class_out = self.class_head(x)
-        
-        # Regression output
-        reg_out = self.reg_head(x)
-        
-        return class_out, reg_out
+        x2 = self.conv2(x1) + self.res1(x1)[:,:,:x2.size(2)]
+        x3 = self.conv3(x2) + self.res2(x2)[:,:,:x3.size(2)]
+        x4 = self.conv4(x3) + self.res3(x3)[:,:,:x4.size(2)]
+        seq,_ = self.lstm(x4.permute(0,2,1))
+        seq = self.ln(seq)
+        w = self.attn(seq)
+        feat = (w * seq).sum(dim=1)
+        return self.class_head(feat), self.reg_head(feat)
+
 # -----------------------------------------------------------------------------
-# 2) Prediction function
+# 2) Prediction function (simplified)
 # -----------------------------------------------------------------------------
 def predict_labels(
     channels: List[str],
     data: np.ndarray,
     fs: float,
     reference_system: str,
-    model_name: str = 'best_model_2.pth'
+    model_name: str = MODEL_PATH
 ) -> Dict[str, Any]:
     """
-    Slides 75k-sample windows with 5k stride over montage data,
-    normalizes each window, then classifies and aggregates predictions
-    into a single global onset/offset if >=3 consecutive windows are positive.
-    Returns seizure metrics plus the raw list of window probabilities.
+    Takes only the first 75 000 samples (5 min) from the montage,
+    runs one pass through the network, and returns its classification
+    and regression outputs (or zeros if non‐seizure).
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Build 6-montage and filter
-    labels, montage, missing = get_6montages(channels, data)
+    # build montage
+    _, montage, missing = get_6montages(channels, data)
+    # filter each channel
     for i in range(montage.shape[0]):
-        sig = montage[i]
-        montage[i] = mne.filter.notch_filter(sig, Fs=fs, freqs=[50.0], verbose=False)
+        s = montage[i]
+        montage[i] = mne.filter.notch_filter(s, Fs=fs, freqs=[50.0], verbose=False)
         montage[i] = mne.filter.filter_data(
             montage[i], sfreq=fs, l_freq=0.5, h_freq=70.0, verbose=False
         )
 
-    # Load model
+    # cut or pad to first WINDOW_SAMPLES
+    n = montage.shape[1]
+    if n >= WINDOW_SAMPLES:
+        win = montage[:, :WINDOW_SAMPLES]
+    else:
+        pad = WINDOW_SAMPLES - n
+        win = np.pad(montage, ((0,0),(0,pad)), mode='constant')
+
+    # turn into tensor
+    x = torch.from_numpy(win).unsqueeze(0).float().to(device)
+
+    # load & run model
     model = SeizureModel().to(device)
     model.load_state_dict(torch.load(model_name, map_location=device))
     model.eval()
-
-    # Slide windows & predict
-    W = 75000
-    S = 5000
-    L = montage.shape[1]
-    probs, positions = [], []
     with torch.no_grad():
-        for start in range(0, L - W + 1, S):
-            window = montage[:, start:start+W]
-            x = torch.from_numpy(window).unsqueeze(0).float().to(device)
-            p, _ = model(x)
-            probs.append(float(p.item()))
-            positions.append(start)
+        p_cls, p_reg = model(x)
+        prob = float(p_cls.item())
+        onset, offset = float(p_reg[0,0].item()), float(p_reg[0,1].item())
 
-    # Binarize
-    flags = [1 if p > 0.5 else 0 for p in probs]
-
-    # Find clusters of >=3 consecutive positives
-    clusters, run = [], []
-    for idx, f in enumerate(flags):
-        if f:
-            run.append(idx)
-        else:
-            if len(run) >= 3:
-                clusters.append((run[0], run[-1]))
-            run = []
-    if len(run) >= 3:
-        clusters.append((run[0], run[-1]))
-
-    # No seizure
-    if not clusters:
+    # threshold at 0.5
+    if prob > 0.5:
+        return {
+            'seizure_present': True,
+            'seizure_confidence': prob,
+            'onset': onset,
+            'onset_confidence': 1.0,
+            'offset': offset,
+            'offset_confidence': 1.0
+        }
+    else:
         return {
             'seizure_present': False,
-            'seizure_confidence': 0.0,
+            'seizure_confidence': prob,
             'onset': 0.0,
             'onset_confidence': 0.0,
             'offset': 0.0,
-            'offset_confidence': 0.0,
+            'offset_confidence': 0.0
         }
-
-    # Global onset/offset
-    first, last = clusters[0][0], clusters[-1][1]
-    s_on = positions[first]
-    s_off = positions[last] + W
-    s_off = min(s_off, L)
-    onset = s_on / fs
-    offset = s_off / fs
-    conf = sum(probs[first:last+1]) / (last - first + 1)
-
-    return {
-        'seizure_present': True,
-        'seizure_confidence': conf,
-        'onset': onset,
-        'onset_confidence': conf,
-        'offset': offset,
-        'offset_confidence': conf,
-
-    }
